@@ -1,19 +1,26 @@
 """
 Generation and calibration of CR pulse.
 """
+
 import os
 import warnings
+import multiprocessing as mpl
 from multiprocessing import Pool
 from functools import partial
 from copy import deepcopy
 
 import numpy as np
 from numpy import pi
-import jax
-import jax.numpy as jnp
 
+try:
+    import jax
+    import jax.numpy as jnp
+except:
+    warnings("JAX not install, multi-derivative pulse doesn't work.")
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 import scipy
 from scipy.signal import find_peaks
 from scipy.optimize import curve_fit
@@ -242,7 +249,7 @@ def pulse_shape(t, params):
         pulse_fun = exact_pulse_transform_single_photon(
             pulse_fun,
             gap12 / params["drag_scale"][1],
-            ratio=jnp.sqrt(2)
+            ratio=jnp.sqrt(2),
             # *(1 - gap12/gap01)
         )
     elif "sw" in params:
@@ -278,28 +285,36 @@ def get_default_cr_params(backend, qc, qt):
     Returns:
     Tuple[Dict, Dict]: Tuple containing dictionaries of parameters for the echoed CNOT gate for control and target qubits.
     """
-    backend_defaults = backend.defaults()
-    inst_sched_map = backend_defaults.instruction_schedule_map
+    inst_sched_map = backend.instruction_schedule_map
 
     def _filter_fun(instruction, pulse="ZX"):
         if pulse == "ZX" and "CR90p_u" in instruction[1].pulse.name:
             return True
+        elif pulse == "ZX" and "CX_u" in instruction[1].pulse.name:
+            return True
         elif pulse == "IX" and "CR90p_d" in instruction[1].pulse.name:
+            return True
+        elif pulse == "IX" and "CX_d" in instruction[1].pulse.name:
             return True
         return False
 
-    cr_sched_default = (
-        inst_sched_map.get("cx", (qc, qt))
-        .filter(instruction_types=[Play])
-        .filter(_filter_fun)
+    def get_cx_gate_schedule(qc, qt):
+        from qiskit.pulse import PulseError
+
+        try:
+            return inst_sched_map.get("ecr", (qc, qt))
+        except PulseError:
+            return inst_sched_map.get("cx", (qc, qt))
+
+    gate_schedule = get_cx_gate_schedule(qc, qt)
+    cr_sched_default = gate_schedule.filter(instruction_types=[Play]).filter(
+        _filter_fun
     )
     cr_instruction = cr_sched_default.instructions[0][1]
     cr_pulse = cr_instruction.pulse
 
-    ix_sched_default = (
-        inst_sched_map.get("cx", (qc, qt))
-        .filter(instruction_types=[Play])
-        .filter(partial(_filter_fun, pulse="IX"))
+    ix_sched_default = gate_schedule.filter(instruction_types=[Play]).filter(
+        partial(_filter_fun, pulse="IX")
     )
     ix_instruction = ix_sched_default.instructions[0][1]
     ix_channel = ix_instruction.channel
@@ -652,8 +667,9 @@ def get_cr_tomo_circuits(
         control_states=control_states,
     )
 
-    with Pool(10) as p:
-        tomo_circs = p.map(tmp_fun, cr_times)
+    # with mpl.Pool(10) as p:
+    #     tomo_circs = p.map(tmp_fun, cr_times)
+    tomo_circs = map(tmp_fun, cr_times)
 
     tomo_circs = sum(tomo_circs, [])
     logger.info("Tomography circuits have been generated.")
@@ -765,6 +781,7 @@ def send_cr_tomography_job(
         "ix_params": ix_params,
         "x_gate_ix_params": x_gate_ix_params,
         "frequency_offset": frequency_offset,
+        "dt": backend.dt,
     }
     logger.info(
         tag
@@ -990,7 +1007,7 @@ def recursive_fit(tlist, eXt, eYt, eZt, p0):
     params = p0.copy()
     # First fit with Z measurement only, no normalization
     include = np.array([False, False, True])
-    params, cov = fit_evolution(tlist, eXt, eYt, eZt, p0, include, normalize=False)
+    params, cov = fit_evolution(tlist, eXt, eYt, eZt, params, include, normalize=False)
 
     # Second fit with Z measurement only, normalization applied
     include = np.array([False, False, True])
@@ -1061,11 +1078,10 @@ def _estimate_period(data, cr_times):
     Returns:
     float: Estimated period of the oscillatory data.
     """
-    peaks = scipy.signal.find_peaks(-np.abs(data), prominence=0.1)[0]
-    if len(peaks) < 2:
-        logger.warning(
-            "Only one peak found in data. Extend the time range of the experiment."
-        )
+    peaks_high, properties = scipy.signal.find_peaks(data, prominence=0.5)
+    peaks_low, properties = scipy.signal.find_peaks(-data, prominence=0.5)
+    peaks = sorted(np.concatenate([peaks_low, peaks_high]))
+    if len(peaks) <= 2:
         return cr_times[-1] - cr_times[0]
     return 2 * np.mean(np.diff(cr_times[peaks]))
 
@@ -1081,6 +1097,7 @@ def _get_normalized_cr_tomography_data(job_id):
     """
     data = load_job_data(job_id)
     result = data["result"]
+    dt = data["parameters"]["dt"]
     cr_times = data["parameters"]["cr_times"]
     shots = data["parameters"]["shots"]
 
@@ -1112,7 +1129,7 @@ def _get_normalized_cr_tomography_data(job_id):
     average = (np.max(splitted_data) + np.min(splitted_data)) / 2
     splitted_data = 2 * (splitted_data - average) / scale
 
-    return cr_times, splitted_data
+    return cr_times, splitted_data, dt
 
 
 def process_single_qubit_tomo_data(job_id, show_plot=False):
@@ -1128,21 +1145,21 @@ def process_single_qubit_tomo_data(job_id, show_plot=False):
     Note:
         Noticed that the measured value is not the IX, IY, IZ in the sense of CR, but the single qubit dynamics when the control qubit is in |0> or |1>.
     """
-    cr_times, splitted_data = _get_normalized_cr_tomography_data(job_id)
+    cr_times, splitted_data, dt = _get_normalized_cr_tomography_data(job_id)
     signal_x, signal_y, signal_z = splitted_data
 
     period = _estimate_period(signal_z, cr_times)
     cutoff = -1
     params, cov = recursive_fit(
-        cr_times[:cutoff] * 0.222e-3,
+        cr_times[:cutoff] * dt * 1.0e6,
         signal_x[:cutoff],
         signal_y[:cutoff],
         signal_z[:cutoff],
-        p0=np.array([1, 1, 1, 1 / (period * 0.222e-3) * 2 * pi, 0.0]),
+        p0=np.array([1, 1, 1, 1 / (period * dt * 1.0e6) * 2 * pi, 0.0]),
     )
     if show_plot:
         plot_cr_ham_tomo(
-            cr_times * 0.222e-3,
+            cr_times * dt * 1.0e6,
             splitted_data,
             ground_params=params,
             ground_cov=cov,
@@ -1155,6 +1172,7 @@ def process_single_qubit_tomo_data(job_id, show_plot=False):
     }
 
 
+## TODO remove dt in the signiture.
 def process_zx_tomo_data(job_id, show_plot=False):
     """Process and analyze ZX tomography data from a job.
 
@@ -1168,31 +1186,44 @@ def process_zx_tomo_data(job_id, show_plot=False):
     Note:
         The effective coupling strength is in the unit of MHz.
     """
-    cr_times, splitted_data = _get_normalized_cr_tomography_data(job_id)
+    cr_times, splitted_data, dt = _get_normalized_cr_tomography_data(job_id)
     signal_x = splitted_data[:2]
     signal_y = splitted_data[2:4]
     signal_z = splitted_data[4:6]
 
     period0 = _estimate_period(signal_z[0], cr_times)
     period1 = _estimate_period(signal_z[1], cr_times)
+
     cutoff = -1
-    ground_params, ground_cov = recursive_fit(
-        cr_times[:cutoff] * 0.222e-3,
-        signal_x[0][:cutoff],
-        signal_y[0][:cutoff],
-        signal_z[0][:cutoff],
-        p0=np.array([1, 1, 1, 1 / (period0 * 0.222e-3) * 2 * pi, 0.0]),
-    )
+    _i = 0
+    while True:
+        try:
+            ground_params, ground_cov = recursive_fit(
+                cr_times[:cutoff] * dt * 1.0e6,
+                signal_x[0][:cutoff],
+                signal_y[0][:cutoff],
+                signal_z[0][:cutoff],
+                p0=np.array([1, 1, 1, 1 / (period0 * dt * 1.0e6) * 2 * pi, 0.0]),
+            )
+            break
+        except RuntimeError as e:
+            _i += 1
+            period0 *= 2
+            if _i > 16:
+                raise e
+            
+
     excited_params, excited_cov = recursive_fit(
-        cr_times[:cutoff] * 0.222e-3,
+        cr_times[:cutoff] * dt * 1.0e6,
         signal_x[1][:cutoff],
         signal_y[1][:cutoff],
         signal_z[1][:cutoff],
-        p0=np.array([1, 1, 1, 1 / (period1 * 0.222e-3) * 2 * pi, 0.0]),
+        p0=np.array([1, 1, 1, 1 / (period1 * dt * 1.0e6) * 2 * pi, 0.0]),
     )
+    # ground_params, ground_cov = excited_params, excited_cov
     if show_plot:
         plot_cr_ham_tomo(
-            cr_times * 0.222e-3,
+            cr_times * dt * 1.0e6,
             splitted_data,
             ground_params,
             excited_params,
@@ -1347,14 +1378,39 @@ def plot_cr_ham_tomo(
 
 
 # %% Iterative calibration
+def _compute_drive_scale(
+    coeff_dict_1, coeff_dict_2, ix_params, prob_ix_strength, conjugate_pulse
+):
+    vau1 = coeff_dict_1["IX"] + 1.0j * coeff_dict_1["IY"]
+    vau2 = coeff_dict_2["IX"] + 1.0j * coeff_dict_2["IY"]
+    A1 = ix_params["amp"] * np.exp(1.0j * ix_params["angle"])
+    A2 = (ix_params["amp"] + prob_ix_strength) * np.exp(1.0j * ix_params["angle"])
+    if conjugate_pulse:
+        return (vau2 - vau1) / np.conjugate(A2 - A1)
+    else:
+        return (vau2 - vau1) / (A2 - A1)
+
+
+def _angle(c):
+    """
+    User arctan to calculate the angle such that -1 won't be transfered to the angle parameters, in this way, a negative ZX will remains the same, not transfered to a positive ZX.
+
+    The output range is (-pi/2, pi/2)
+    """
+    if c.real == 0.0:
+        return np.pi / 2
+    return np.arctan(c.imag / c.real)
+
+
 def update_pulse_params(
     coeff_dict_1,
     coeff_dict_2,
     cr_params,
     ix_params,
     prob_ix_strength,
-    target_IX_angle=0.0,
+    target_IX_strength=None,
     backend_name=None,
+    real_only=False,
 ):
     """
     Update pulse parameters for CR and IX gates based on tomography results. Refer to arxiv 2303.01427 for the derivation.
@@ -1365,51 +1421,63 @@ def update_pulse_params(
         cr_params (dict): Parameters for the CR gate pulse.
         ix_params (dict): Parameters for the IX gate pulse.
         prob_ix_strength (float): The strength of the IX gate pulse.
-        target_IX_angle (float, optional): Target angle for IX gate. Default is 0.
+        target_IX_strength (float, optional): Target angle for IX gate. Default is 0.
+        backend_name (str):
+        real_only: Update only the real part of the drive.
 
     Returns:
         tuple: Updated CR parameters, Updated IX parameters, None (for compatibility with CR-only calibration).
     """
-    if backend_name == "DynamicsBackend":
-        sign = -1.0  # dynamics end has a different convension
-    else:
-        sign = 1.0
     cr_params = cr_params.copy()
     ix_params = ix_params.copy()
+    if backend_name == "DynamicsBackend":
+        sign = -1  # dynamics end has a different convension
+    else:
+        sign = 1
     if "ZX" in coeff_dict_1:
-        phi0 = -sign * np.arctan(coeff_dict_1["ZY"] / coeff_dict_1["ZX"])
+        phi0 = _angle(coeff_dict_1["ZX"] + 1.0j * coeff_dict_1["ZY"])
     else:
         # No CR tomography, only single target qubit tomography.
         phi0 = 0.0
-    cr_params["angle"] += phi0
+    cr_params["angle"] -= sign * phi0
 
-    # Compute the linear complex ratio between the effective dynamics IX, IY and and target drive
-    coeff_diff_T = (coeff_dict_2["IX"] - coeff_dict_1["IX"]) + 1.0j * (
-        coeff_dict_2["IY"] - coeff_dict_1["IY"]
+    drive_scale = _compute_drive_scale(
+        coeff_dict_1, coeff_dict_2, ix_params, prob_ix_strength, backend_name
     )
-    lamda = -np.arctan(coeff_diff_T.imag / coeff_diff_T.real)
-    delta_w_T = coeff_diff_T * np.exp(1.0j * lamda)
-    if (delta_w_T.imag) > 1.0e-6:
-        raise ValueError("Something went wrong in the calculation")
-    C_T = delta_w_T.real / prob_ix_strength.real
+    logger.info(
+        "Estimated drive scale: \n"
+        f"{drive_scale/1000}" + "\n"
+        f"{drive_scale/np.exp(1.j*_angle(drive_scale))/1000}" + "\n"
+        f"{_angle(drive_scale)}"
+    )
 
     # Update the IX drive strength and phase
-    new_omega_relative = (
-        target_IX_angle - (coeff_dict_1["IX"] + 1.0j * coeff_dict_1["IY"])
-    ) * np.exp(1.0j * (lamda)) / C_T + ix_params[
-        "amp"
-    ]  # phase is the relative phase, not including phi0 and ix_params["angle"]
-    # changed for qiskit-dynamics
-    delta_angle = sign * np.arctan(new_omega_relative.imag / new_omega_relative.real)
-    ix_params["angle"] += delta_angle + phi0
-    ix_params["amp"] = np.real(new_omega_relative * np.exp(-1.0j * delta_angle))
-    if "ZX" in coeff_dict_1:
-        return cr_params, ix_params, None
+    vau1 = coeff_dict_1["IX"] + 1.0j * coeff_dict_1["IY"]
+    A1 = ix_params["amp"] * np.exp(sign * 1.0j * ix_params["angle"])
+    new_drive = (target_IX_strength - vau1) / drive_scale + A1
+    if real_only:
+        ix_params["amp"] = np.real(new_drive)
     else:
-        return cr_params, None, ix_params
+        new_angle = _angle(new_drive)
+        ix_params["amp"] = np.real(new_drive / np.exp(1.0j * new_angle))
+        ix_params["angle"] = sign * (new_angle - phi0)
+    if "ZX" in coeff_dict_1:
+        return (
+            cr_params,
+            ix_params,
+            None,
+            np.real(drive_scale / np.exp(1.0j * _angle(drive_scale)) / 1000),
+        )
+    else:
+        return (
+            cr_params,
+            None,
+            ix_params,
+            np.real(drive_scale / np.exp(1.0j * _angle(drive_scale)) / 1000),
+        )
 
 
-def _update_frequency_offset(old_calibration_data, mode):
+def _update_frequency_offset(old_calibration_data, mode, backend_name):
     """
     This should not be used separatly because applying more than once will lead to the wrong offset.
     """
@@ -1421,7 +1489,10 @@ def _update_frequency_offset(old_calibration_data, mode):
         coeffs_dict = old_calibration_data["x_gate_coeffs"]
         frequency_offset_key = "x_gate_frequency_offset"
 
-    correction = coeffs_dict["IZ"] * 1.0e6
+    if backend_name == "DynamicsBackend":
+        correction = coeffs_dict["IZ"] * 1.0e6
+    else:
+        correction = -0.5 * coeffs_dict["IZ"] * 1.0e6
     new_calibration_data[frequency_offset_key] = (
         old_calibration_data.get(frequency_offset_key, 0.0) + correction
     )
@@ -1448,8 +1519,11 @@ def iterative_cr_pulse_calibration(
     restart=False,
     rerun_last_calibration=True,
     max_repeat=4,
-    shots=1024,
+    shots=None,
     mode="CR",
+    IX_ZX_ratio=None,
+    save_result=True,
+    control_states=None,
 ):
     """
     Iteratively calibrates CR pulses on the given qubits to remove the IX, ZY, IY terms. The result is saved in the carlibtaion data file and can be accessed via `read_calibration_data`.
@@ -1467,14 +1541,15 @@ def iterative_cr_pulse_calibration(
         rerun_last_calibration (bool, optional): Whether to rerun the last calibration. Default is True.
         max_repeat (int, optional): Maximum number of calibration repetitions. Default is 4.
         shots (int, optional): Number of shots for each tomography job. Default is 1024.
-        mode (str, optional): Calibration mode, "CR" or "IX-pi". Default is "CR".
+        mode (str, optional): Calibration mode, "CR" or "IX-pi". Default is "CR". The CR mode is used to measure the ZX and ZZ strength. It only updates the phase of CR drive and the IX drive but not IY. The "IX-pi" mode updates the target drive for a CNOT gate.
     """
-    if mode == "CR":
-        control_states = (0, 1)
-    elif mode == "IX-pi":
-        control_states = (1,)
-    else:
-        ValueError("Mode must be either 'CR' or 'IX-pi/2'.")
+    if control_states is None:
+        if mode == "CR":
+            control_states = (0, 1)
+        elif mode == "IX-pi":
+            control_states = (1,)
+        else:
+            ValueError("Mode must be either 'CR' or 'IX-pi/2'.")
     if not restart:
         try:  # Load existing calibration
             logger.info("Loading existing calibration data...")
@@ -1521,11 +1596,28 @@ def iterative_cr_pulse_calibration(
             qubit_calibration_data["x_gate_frequency_offset"] = qubit_calibration_data[
                 "frequency_offset"
             ]
+    shots = 512 if shots is None else shots
 
-    if mode == "IX-pi":
-        target_IX_angle = -qubit_calibration_data["coeffs"]["ZX"] * 2
-    else:
-        target_IX_angle = 0.0
+    if mode == "CR" and IX_ZX_ratio is None:
+        IX_ZX_ratio = 0.0
+    elif mode == "IX-pi" and IX_ZX_ratio is None:
+        IX_ZX_ratio = -2
+    try:
+        target_IX_strength = qubit_calibration_data["coeffs"]["ZX"] * IX_ZX_ratio
+    except:
+        target_IX_strength = 0.0
+    logger.info(f"Target IX / ZX ratio: {IX_ZX_ratio}")
+
+    def _get_error(coeff_dict, mode, target_IX):
+        if mode == "CR":
+            error = np.array(
+                (coeff_dict["IX"] - target_IX, coeff_dict["IY"], coeff_dict["ZY"])
+            )
+        elif mode == "IX-pi":
+            error = np.array((coeff_dict["IX"] - target_IX, coeff_dict["IY"]))
+        error = np.abs(error)
+        max_error = np.max(error)
+        return max_error
 
     def _error_smaller_than(coeff_dict, threshold_MHz, mode, target_IX=None):
         """
@@ -1541,7 +1633,9 @@ def iterative_cr_pulse_calibration(
             bool: True if error is smaller than threshold, False otherwise.
         """
         if mode == "CR":
-            error = np.array((coeff_dict["IX"], coeff_dict["IY"], coeff_dict["ZY"]))
+            error = np.array(
+                (coeff_dict["IX"] - target_IX, coeff_dict["IY"], coeff_dict["ZY"])
+            )
         elif mode == "IX-pi":
             error = np.array((coeff_dict["IX"] - target_IX, coeff_dict["IY"]))
         error = np.abs(error)
@@ -1550,7 +1644,7 @@ def iterative_cr_pulse_calibration(
         logger.info(f"Remaining dominant error: {error_type}: {max_error} MHz" + "\n")
         return max_error < threshold_MHz
 
-    def _step_cr(qubit_calibration_data, prob_ix_strength, n):
+    def _step_cr(qubit_calibration_data, n):
         """
         Submit two jobs, one with the given pulse parameter. If the calibration is not finished, submit another one with a shifted amplitude for the target drive. This will be used to calculate a new set of pulse parameters and returned.
 
@@ -1585,6 +1679,12 @@ def iterative_cr_pulse_calibration(
                 control_states=control_states,
             )
         coeff_dict_1 = process_zx_tomo_data(tomo_id1, show_plot=verbose)
+
+        target_IX_strength = (
+            IX_ZX_ratio
+            * np.sign(coeff_dict_1["ZX"])
+            * np.sqrt(coeff_dict_1["ZX"] ** 2 + coeff_dict_1["ZY"] ** 2)
+        )
         if verbose:
             logger.info("Tomography results:\n" + str(coeff_dict_1) + "\n")
 
@@ -1596,7 +1696,12 @@ def iterative_cr_pulse_calibration(
         )
 
         # Interrupt the process if the calibration is successful or maximal repeat number is reached.
-        if _error_smaller_than(coeff_dict_1, threshold_MHz, mode, target_IX_angle):
+        if np.abs(qubit_calibration_data["coeffs"]["IZ"]) > threshold_MHz:
+            if not (not rerun_last_calibration and n == 1):
+                qubit_calibration_data = _update_frequency_offset(
+                    qubit_calibration_data, mode, backend.name
+                )
+        if _error_smaller_than(coeff_dict_1, threshold_MHz, mode, target_IX_strength):
             logger.info("Successfully calibrated.")
             return qubit_calibration_data, True
         if n > max_repeat:
@@ -1606,18 +1711,22 @@ def iterative_cr_pulse_calibration(
             return qubit_calibration_data, True
 
         # If not completed, send another job with shifted IX drive amplitude.
-        prob_ix_strength_MHz = target_IX_angle - np.real(
-            (coeff_dict_1["IX"] + 1.0j * coeff_dict_1["IY"])
-            * np.exp(1.0j * np.arctan(coeff_dict_1["ZY"] / coeff_dict_1["ZX"]))
+        # Remark: There is a strange observation that the Omega_GHz_amp_ratio measured here is not the same as the one estimated from single-qubit gate duration. There is a
+        Omega_GHz_amp_ratio = qubit_calibration_data.get(
+            "_omega_amp_ratio", amp_to_omega_GHz(backend, qubits[1], 1)
         )
-        if np.abs(prob_ix_strength_MHz) > 0.1:  # Minimum 1 MHz
-            prob_ix_strength = omega_GHz_to_amp(
-                backend, qubits[1], (prob_ix_strength_MHz) * 1.0e-3
-            )
+        logger.info(f"Omega[GHz]/amp: {Omega_GHz_amp_ratio}")
+        Omega_GHz_amp_ratio = np.real(Omega_GHz_amp_ratio)
+        prob_ix_strength_MHz = target_IX_strength - coeff_dict_1["IX"]
+        if np.abs(prob_ix_strength_MHz) > 0.1:  # Minimum 0.1 MHz
+            prob_ix_strength = prob_ix_strength_MHz * 1.0e-3 / Omega_GHz_amp_ratio
+            logger.info(f"Probe amp shift [MHz]: {prob_ix_strength_MHz} MHz")
         else:
-            prob_ix_strength = np.sign(prob_ix_strength_MHz) * omega_GHz_to_amp(
-                backend, qubits[1], 0.1e-3
+            prob_ix_strength = (
+                np.sign(prob_ix_strength_MHz) * 0.1e-3 / Omega_GHz_amp_ratio
             )
+            logger.info("Probe amp shift [MHz]: 0.1 MHz")
+        logger.info(f"Probe amp shift (amp): {prob_ix_strength}")
 
         tomo_id2 = shifted_parameter_cr_job(
             qubits,
@@ -1637,26 +1746,34 @@ def iterative_cr_pulse_calibration(
         if verbose:
             logger.info(coeff_dict_2)
         # Compute the new parameters.
-        cr_params, updated_ix_params, updated_x_gate_ix_params = update_pulse_params(
+        (
+            cr_params,
+            updated_ix_params,
+            updated_x_gate_ix_params,
+            omega_amp_ratio,
+        ) = update_pulse_params(
             coeff_dict_1,
             coeff_dict_2,
             cr_params,
             ix_params,
             prob_ix_strength,
-            target_IX_angle=target_IX_angle,
+            target_IX_strength=target_IX_strength,
             backend_name=backend.name,
+            # only update the real part, imaginary part can be
+            # unstable for small pulse ampliutude.
+            real_only=True,
         )
         # This should not be added before the second experiment because it should only have a different IX drive amplitude.
         qubit_calibration_data.update(
-            {"cr_params": cr_params, "ix_params": updated_ix_params}
+            {
+                "cr_params": cr_params,
+                "ix_params": updated_ix_params,
+                "_omega_amp_ratio": np.real(omega_amp_ratio),
+            }
         )
-        if np.abs(qubit_calibration_data["coeffs"]["IZ"]) > threshold_MHz:
-            qubit_calibration_data = _update_frequency_offset(
-                qubit_calibration_data, mode
-            )
         return qubit_calibration_data, False
 
-    def _step_ix(qubit_calibration_data, prob_ix_strength, n):
+    def _step_ix(qubit_calibration_data, n):
         """
         Submit two jobs, one with the given pulse parameter. If the calibration is not finished, submit another one with a shifted amplitude for the target drive. This will be used to calculate a new set of pulse parameters and returned.
 
@@ -1668,6 +1785,10 @@ def iterative_cr_pulse_calibration(
         Returns:
             tuple: Updated qubit_calibration_data, Calibration success flag.
         """
+        if len(control_states) == 2:
+            process_data_fun = process_zx_tomo_data
+        else:
+            process_data_fun = process_single_qubit_tomo_data
         cr_params = qubit_calibration_data["cr_params"]
         ix_params = qubit_calibration_data["ix_params"]
         x_gate_ix_params = qubit_calibration_data["x_gate_ix_params"]
@@ -1690,8 +1811,8 @@ def iterative_cr_pulse_calibration(
                 shots=shots,
                 control_states=control_states,
             )
-            # tomo_id1 = "ck409c4ai8c00ck0kd3g"
-        coeff_dict_1 = process_single_qubit_tomo_data(tomo_id1, show_plot=verbose)
+        coeff_dict_1 = process_data_fun(tomo_id1, show_plot=verbose)
+
         if verbose:
             logger.info("Tomography results:\n" + str(coeff_dict_1) + "\n")
 
@@ -1702,7 +1823,12 @@ def iterative_cr_pulse_calibration(
             }
         )
         # Interrupt the process if the calibration is successful or maximal repeat number is reached.
-        if _error_smaller_than(coeff_dict_1, threshold_MHz, mode, target_IX_angle):
+        if np.abs(qubit_calibration_data["coeffs"]["IZ"]) > threshold_MHz:
+            if not (not rerun_last_calibration and n == 1):
+                qubit_calibration_data = _update_frequency_offset(
+                    qubit_calibration_data, mode, backend.name
+                )
+        if _error_smaller_than(coeff_dict_1, threshold_MHz, mode, target_IX_strength):
             logger.info("Successfully calibrated.")
             return qubit_calibration_data, True
         if n > max_repeat:
@@ -1712,15 +1838,21 @@ def iterative_cr_pulse_calibration(
             return qubit_calibration_data, True
 
         # If not completed, send another job with shifted IX drive amplitude.
-        prob_ix_strength_MHz = target_IX_angle - coeff_dict_1["IX"]
-        if np.abs(prob_ix_strength_MHz) > 0.1:
-            prob_ix_strength = omega_GHz_to_amp(
-                backend, qubits[1], (prob_ix_strength_MHz) * 1.0e-3
-            )
+        Omega_GHz_amp_ratio = qubit_calibration_data.get(
+            "_omega_amp_ratio", amp_to_omega_GHz(backend, qubits[1], 1)
+        )
+        Omega_GHz_amp_ratio = np.real(Omega_GHz_amp_ratio)
+        logger.info(f"Omega[GHz]/amp: {Omega_GHz_amp_ratio}")
+        prob_ix_strength_MHz = target_IX_strength - coeff_dict_1["IX"]
+        if np.abs(prob_ix_strength_MHz) > 0.1:  # Minimum 0.1 MHz
+            prob_ix_strength = prob_ix_strength_MHz * 1.0e-3 / Omega_GHz_amp_ratio
+            logger.info(f"Probe amp shift [MHz]: {prob_ix_strength_MHz} MHz")
         else:
-            prob_ix_strength = np.sign(prob_ix_strength_MHz) * omega_GHz_to_amp(
-                backend, qubits[1], 0.1e-3
+            prob_ix_strength = (
+                np.sign(prob_ix_strength_MHz) * 0.1e-3 / Omega_GHz_amp_ratio
             )
+            logger.info("Probe amp shift [MHz]: 0.1 MHz")
+        logger.info(f"Probe amp shift (amp): {prob_ix_strength}")
         tomo_id2 = shifted_parameter_cr_job(
             qubits,
             backend,
@@ -1736,57 +1868,50 @@ def iterative_cr_pulse_calibration(
             control_states=control_states,
             mode=mode,
         )
-        coeff_dict_2 = process_single_qubit_tomo_data(tomo_id2, show_plot=verbose)
+        coeff_dict_2 = process_data_fun(tomo_id2, show_plot=verbose)
         if verbose:
             logger.info(coeff_dict_2)
         # Compute the new parameters.
-        cr_params, _, updated_x_gate_ix_params = update_pulse_params(
+        cr_params, _, updated_x_gate_ix_params, omega_amp_ratio = update_pulse_params(
             coeff_dict_1,
             coeff_dict_2,
             cr_params,
             x_gate_ix_params,
             prob_ix_strength,
-            target_IX_angle=target_IX_angle,
+            target_IX_strength=target_IX_strength,
             backend_name=backend.name,
         )
 
-        qubit_calibration_data["x_gate_ix_params"] = updated_x_gate_ix_params
-        if np.abs(qubit_calibration_data["coeffs"]["IZ"]) > threshold_MHz:
-            qubit_calibration_data = _update_frequency_offset(
-                qubit_calibration_data, mode
-            )
+        qubit_calibration_data.update(
+            {
+                "x_gate_ix_params": updated_x_gate_ix_params,
+                "_omega_amp_ratio": np.real(omega_amp_ratio),
+            }
+        )
         return qubit_calibration_data, False
 
     succeed = False
     n = 1
-    if restart:
-        prob_ix_strength = omega_GHz_to_amp(backend, qubits[1], 0.5e-3 / 2)
-    else:
-        prob_ix_strength = omega_GHz_to_amp(backend, qubits[1], 0.1e-3 / 2)
+    error = np.inf
     while (
         not succeed and n <= max_repeat + 1
     ):  # +1 because we need one last run for the calibration data.
         logger.info(f"\n\nCR calibration round {n}: ")
         if mode == "CR":
-            qubit_calibration_data, succeed = _step_cr(
-                qubit_calibration_data, prob_ix_strength, n
-            )
+            qubit_calibration_data, succeed = _step_cr(qubit_calibration_data, n)
         else:
-            qubit_calibration_data, succeed = _step_ix(
-                qubit_calibration_data, prob_ix_strength, n
-            )
-        prob_ix_strength = (
-            prob_ix_strength / 2
-            if prob_ix_strength > omega_GHz_to_amp(backend, qubits[1], 0.1e-3 / 2)
-            else omega_GHz_to_amp(backend, qubits[1], 0.1e-3 / 2)
+            qubit_calibration_data, succeed = _step_ix(qubit_calibration_data, n)
+        target_IX_strength = qubit_calibration_data["coeffs"]["ZX"] * IX_ZX_ratio
+        new_error = _get_error(
+            qubit_calibration_data["coeffs"], mode, target_IX_strength
         )
+        if save_result and new_error < error:
+            save_calibration_data(backend, gate_name, qubits, qubit_calibration_data)
+            logger.info("CR calibration data saved.")
         n += 1
-    if np.abs(qubit_calibration_data["coeffs"]["IZ"]) > threshold_MHz:
-        qubit_calibration_data = _update_frequency_offset(qubit_calibration_data, mode)
+        shots = 2 * shots if shots < 2048 else shots
     if not succeed:
-        warnings.warn(f"CR calibration failed after {n} round.")
-
-    save_calibration_data(backend, gate_name, qubits, qubit_calibration_data)
+        logger.warn(f"CR calibration failed after {n} round.")
 
 
 def iy_drag_calibration(
@@ -1798,6 +1923,7 @@ def iy_drag_calibration(
     verbose=False,
     threshold_MHz=0.015,
     delta_beta=None,
+    shots=1024,
 ):
     """Calibrate the IY-DRAG pulse for the qubits and a precalibrated CR pulse. It samples 3 "beta" value in the "ix_params" and perform an linear fit to obtain the correct IY-DRAG coefficient "beta" that zeros the ZZ interaction.
 
@@ -1837,9 +1963,9 @@ def iy_drag_calibration(
     ZZ_coeff_list = []
     for _, beta in enumerate(beta_list):
         if np.abs(beta - old_beta) < 1.0e-6:
-            shots = 2048
+            _shots = shots * 2
         else:
-            shots = 1024
+            _shots = shots
         ix_params["beta"] = beta
         job_id = send_cr_tomography_job(
             qubits,
@@ -1850,7 +1976,7 @@ def iy_drag_calibration(
             frequency_offset=frequency_offset,
             blocking=True,
             session=session,
-            shots=shots,
+            shots=_shots,
         )
         coeff_dict = process_zx_tomo_data(job_id, show_plot=verbose)
         ZZ_coeff_list.append(coeff_dict["ZZ"])
@@ -1865,6 +1991,10 @@ def iy_drag_calibration(
                 }
             )
             save_calibration_data(backend, gate_name, qubits, qubit_calibration_data)
+            if np.abs(qubit_calibration_data["coeffs"]["IZ"]) > threshold_MHz:
+                qubit_calibration_data = _update_frequency_offset(
+                    qubit_calibration_data, "CR", backend.name
+                )
             return
 
     logger.info(f"ZZ sampling measurements complete : {ZZ_coeff_list}." + "\n")
@@ -1896,7 +2026,7 @@ def iy_drag_calibration(
         frequency_offset=frequency_offset,
         blocking=True,
         session=session,
-        shots=2048,
+        shots=shots * 2,
     )
 
     # Compute the interaction strength and save the calibration data.
@@ -1910,7 +2040,9 @@ def iy_drag_calibration(
         }
     )
     if np.abs(qubit_calibration_data["coeffs"]["IZ"]) > threshold_MHz:
-        qubit_calibration_data = _update_frequency_offset(qubit_calibration_data, "CR")
+        qubit_calibration_data = _update_frequency_offset(
+            qubit_calibration_data, "CR", backend.name
+        )
 
     save_calibration_data(backend, gate_name, qubits, qubit_calibration_data)
     logger.info(f"IY-DRAG calibration complete, new calibration data saved.")

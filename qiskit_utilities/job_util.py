@@ -10,6 +10,7 @@ import multiprocessing
 from copy import deepcopy
 from datetime import datetime
 import threading
+import numpy as np
 
 from qiskit_ibm_runtime import QiskitRuntimeService, RuntimeJob, Session
 
@@ -212,6 +213,7 @@ def load_job_data(job: str, blocking=False, path="data"):
         job_id = job
 
     def _acquire_data(job_id):
+
         with open(path + "/" + job_id + ".pickle", "rb") as f:
             data = pickle.load(f)
         #####################
@@ -299,7 +301,7 @@ def execute_job(runner, *args, **kwargs):
     return job
 
 
-def retrive_expdata(job, backend):
+def retrieve_expdata(job, backend, exp):
     """
     Retrieve qiskit-experiment data associated with a job ID and backend.
 
@@ -310,10 +312,10 @@ def retrive_expdata(job, backend):
     Returns:
         ExperimentData: Experimental data associated with the job.
     """
-    job_data = load_job_data(job)
-    exp = job_data["exp"]
     expdata = exp._initialize_experiment_data()
-    if isinstance(job, str) and backend.name == "DynamicsBackend":
+    if isinstance(backend, QiskitRuntimeService):
+        expdata.add_jobs([backend.job(job)])
+    elif isinstance(job, str) and backend.name == "DynamicsBackend":
         raise ValueError("For DynamicsBackend, please provides the job instance.")
     elif backend.name == "DynamicsBackend":
         expdata.add_jobs([job])
@@ -324,6 +326,8 @@ def retrive_expdata(job, backend):
 
 
 def _get_amp_omega_GHz_ratio(backend, qubit_ind):
+    if backend.name == "DynamicsBackend":
+        return 2 * np.pi
     x_pulse = (
         backend.target.instruction_schedule_map()
         .get("x", qubit_ind)
@@ -372,6 +376,7 @@ def omega_GHz_to_amp(backend, qubit_ind, omega_GHz):
 
 
 def save_calibration_data(backend, gate_name, qubits, qubit_calibration_data):
+
     backend_name = backend if isinstance(backend, str) else backend.name
     with threading.Lock():
         # Preventing the file being read by different threads at the same time.
@@ -388,6 +393,7 @@ def save_calibration_data(backend, gate_name, qubits, qubit_calibration_data):
 
 
 def read_calibration_data(backend, gate_name, qubit_ind):
+
     with open("calibration_data.pickle", "rb") as f:
         calibration_data = pickle.load(f)
     backend_name = backend if isinstance(backend, str) else backend.name

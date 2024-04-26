@@ -1,6 +1,7 @@
 """
-This file is based on the tutorial of qiskit-dynamics
+This file is based on the tutorial of qiskit-dynamics.
 """
+
 # Configure to use JAX internally
 import jax
 
@@ -30,7 +31,7 @@ from qiskit_experiments.library.calibration import RoughXSXAmplitudeCal
 
 
 def initilize_qiskit_dynamics_backend(
-    f0, f1, a0, a1, cr_detuning=0.0, custom_experiment_result_function=None
+    f0, f1, a0, a1, J, cr_detuning=0.0, custom_experiment_result_function=None
 ):
     dim = 4
 
@@ -41,8 +42,6 @@ def initilize_qiskit_dynamics_backend(
     v1 = f1
     anharm1 = a1
     r1 = 1.0e9 / 2 / np.pi
-
-    J = 0.0033e9
 
     a = np.diag(np.sqrt(np.arange(1, dim)), 1)
     adag = np.diag(np.sqrt(np.arange(1, dim)), -1)
@@ -89,7 +88,12 @@ def initilize_qiskit_dynamics_backend(
     #         "max_dt": dt * 10
     #     }
     # else:
-    solver_options = {"method": "jax_odeint", "atol": 1e-6, "rtol": 1e-8, "hmax": dt}
+    solver_options = {
+        "method": "jax_odeint",
+        "atol": 1e-6,
+        "rtol": 1e-8,
+        "hmax": dt * 10,
+    }
 
     if custom_experiment_result_function is None:
         backend = DynamicsBackend(

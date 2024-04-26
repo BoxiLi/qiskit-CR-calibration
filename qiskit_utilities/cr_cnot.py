@@ -1,6 +1,7 @@
 """
 Generation of echoed and direct CNOT gate based on calibrated CR pulse data.
 """
+
 from copy import deepcopy
 
 import numpy as np
@@ -19,6 +20,7 @@ from .job_util import (
     save_job_data,
     read_calibration_data,
     save_calibration_data,
+    omega_GHz_to_amp,
 )
 from .cr_pulse import (
     process_zx_tomo_data,
@@ -67,7 +69,7 @@ def fit_function(
             p0=init_params,
         )
     except RuntimeError as e:
-        warnings.warn("RuntimeError in the optimization")
+        logger.warn("RuntimeError in the optimization")
         fitparams = init_params
 
     xline = np.linspace(xdata[0], xdata[-1], 100)
@@ -179,7 +181,7 @@ def estimate_cr_width(job_id, angle="90"):
             raise ValueError("Unknown angle")
         return estimated_result
 
-    cr_times, splitted_data = _get_normalized_cr_tomography_data(job_id)
+    cr_times, splitted_data, dt = _get_normalized_cr_tomography_data(job_id)
     signal_z0 = splitted_data[4]
     signal_z1 = splitted_data[5]
     est1 = _helper(cr_times, signal_z0)
@@ -189,6 +191,7 @@ def estimate_cr_width(job_id, angle="90"):
             "The estimated CR pulse time is different for control qubit in state 0 and 1. This indicate that the ZX interaction strength is not well calibrated."
         )
     estimated_result = (est1 + est2) / 2
+    estimated_result = _helper(cr_times, signal_z1)
     estimated_result = (estimated_result + 8) // 16 * 16
     return int(estimated_result)
 
@@ -391,10 +394,10 @@ def create_direct_cnot_schedule(
     if with_separate_x:
         x_gate_ix_params = None
     else:
-        x_gate_ix_params = calibration_data["x_gate_ix_params"]
+        x_gate_ix_params = deepcopy(calibration_data["x_gate_ix_params"])
     calibrated_cr_tomo_id = calibration_data["calibration_job_id"]
-    rz0_correction = calibration_data["rz0_correction"]
-    frequency_offset = calibration_data["x_gate_frequency_offset"]
+    rz0_correction = calibration_data.get("rz0_correction", 0.0)
+    frequency_offset = calibration_data.get("x_gate_frequency_offset", 0.0)
     ZX_sign = _get_ZX_sign(calibrated_cr_tomo_id)
     duration = estimate_cr_width(calibrated_cr_tomo_id, angle="90")
 
@@ -471,7 +474,7 @@ def get_rz0_amplification_circuits(num_gates_list, phase_list):
         circ.h(0)
         circ.measure(0, 0)
         circ.measure(1, 1)
-        circ_list += [circ.bind_parameters({phase: p}) for p in phase_list]
+        circ_list += [circ.assign_parameters({phase: p}) for p in phase_list]
     return circ_list
 
 
@@ -507,7 +510,7 @@ def get_rz0_pi_calibration_circuits(phase_list):
     circ.measure(0, 0)
     circ.measure(1, 1)
 
-    return [circ.bind_parameters({phase: p}) for p in phase_list]
+    return [circ.assign_parameters({phase: p}) for p in phase_list]
 
 
 def send_rz0_calibration_job(backend, qubits, phase_list, circ_list, session):
@@ -622,7 +625,9 @@ def rough_rz0_correction_calibration(backend, qubits, gate_name, session):
     save_calibration_data(backend, gate_name, qubits, calibration_data)
 
 
-def fine_rz0_correction_calibration(backend, qubits, gate_name, session):
+def fine_rz0_correction_calibration(
+    backend, qubits, gate_name, session, num_repeat_cnot=2
+):
     """
     Perform a fine-tuning calibration of the phase correction on the control qubit.
 
@@ -642,7 +647,7 @@ def fine_rz0_correction_calibration(backend, qubits, gate_name, session):
     )
 
     narrow_phase_list = rz0_correction + np.linspace(-pi / 10, pi / 10, 50)
-    circ_list = get_rz0_amplification_circuits((6,), narrow_phase_list)
+    circ_list = get_rz0_amplification_circuits((num_repeat_cnot,), narrow_phase_list)
 
     backend = deepcopy(backend)
     backend.target.add_instruction(
@@ -684,3 +689,175 @@ def fine_rz0_correction_calibration(backend, qubits, gate_name, session):
     calibration_data["rz0_correction"] = rz0_correction
     logger.info(f"Fine-tuning RZ0 correction: {rz0_correction}")
     save_calibration_data(backend, gate_name, qubits, calibration_data)
+
+
+# %% Fine-tuning the ZX and IX strength
+def _CR_angle_error_amplification(backend, qubits, gate_name, session, max_num_gate):
+    custom_cnot = Gate("custom_cnot", 2, [])
+    circ_list = []
+    for initial_state in [0, 1]:
+        for num_gate in range(max_num_gate):
+            circ = QuantumCircuit(2, 1)
+            if initial_state == 1:
+                circ.x(0)
+            circ.rx(pi / 2, 1)
+            for _ in range(num_gate):
+                circ.barrier()
+                circ.append(custom_cnot, [0, 1], [])
+            circ.measure(1, 0)
+            circ_list.append(circ)
+
+    calibration_data = read_calibration_data(backend, gate_name, qubits)
+
+    modified_calibration_data = deepcopy(calibration_data)
+    custom_cnot_sched = create_direct_cnot_schedule(
+        backend, qubits, modified_calibration_data, with_separate_x=False
+    )
+
+    backend_tmp = deepcopy(backend)
+    backend_tmp.target.add_instruction(
+        custom_cnot,
+        {qubits: InstructionProperties(calibration=custom_cnot_sched)},
+        name="custom_cnot",
+    )
+
+    transpiled_circ_list = transpile(
+        circ_list,
+        backend=backend_tmp,
+        basis_gates=backend_tmp.configuration().basis_gates + ["custom_cnot"],
+        initial_layout=qubits,
+        optimization_level=1,
+    )
+
+    shots = 1024
+    job = session.run(
+        "circuit-runner",
+        inputs={
+            "circuits": transpiled_circ_list,
+            "skip_transpilation": True,
+            "shots": shots,
+        },
+    )
+    parameters = {
+        "name": "Fine CR amplitude calibration",
+        "backend": backend_tmp.name,
+        "qubits": qubits,
+        "gate_name": gate_name,
+        "phase_list": max_num_gate,
+        "shots": shots,
+        "calibration": calibration_data,
+    }
+    logger.info(
+        "ZI calibration ID: "
+        + job.job_id()
+        + "\n"
+        + "\n".join([f"{key}: {val}" for key, val in parameters.items()])
+        + "\n"
+    )
+    save_job_data(job, backend=backend_tmp, parameters=parameters)
+    logger.info("CR angle fine-tuning job complete.")
+
+    result = load_job_data(job)["result"]
+    return job.job_id()
+
+
+def _analyize_CR_angle_data(
+    job_id,
+):
+    data = load_job_data(job_id)
+    result = data["result"]
+    shots = data["parameters"]["shots"]
+    qubits = data["parameters"]["qubits"]
+    prob_list = np.array(
+        [result.get_counts(i).get("0", 0) / shots for i in range(len(result.results))]
+    )
+    plt.plot(prob_list[: len(prob_list) // 2], "o-", label="control 0")
+    plt.plot(prob_list[len(prob_list) // 2 :], "o-", label="control 1")
+    plt.legend()
+    control0_data = prob_list[: len(prob_list) // 2]
+    control1_data = prob_list[len(prob_list) // 2 :]
+
+    import warnings
+
+    def _func1(x, epsZX, epsIX, B):
+        with warnings.catch_warnings():
+            # Ignore the Runtime warning when x is not an integer.
+            # This happens because in `fit_function` we plot func as a function of x.
+            # It will gives nan, automatically ignore in the plot, so we just hide the warning here.
+            # One needs to plot the fitted points manually.
+            warnings.simplefilter("ignore")
+            result = (
+                1 * (-1) ** x * (np.cos(pi / 2 + pi / 4 * x * (-epsZX - epsIX))) + 0.5
+            )
+        return result
+
+    def _func0(x, epsZX, epsIX, B):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = 1 * (np.cos(pi / 2 + pi / 4 * x * (epsZX - epsIX))) + 0.5
+        return result
+
+    def _fun(x, epsZX, epsIX, B):
+        result1 = _func1(x, epsZX, epsIX, B)
+        result0 = _func0(x, epsZX, epsIX, B)
+        return np.concatenate([result0, result1])
+
+    data_to_fit = np.concatenate([control0_data, control1_data])
+    iteration_number = len(control0_data)
+    with warnings.catch_warnings():
+        # Ignore OptimizeWarning of SciPy because the Covariance cannot be calculated.
+        warnings.simplefilter("ignore")
+        params = fit_function(
+            _fun,
+            list(range(iteration_number)),
+            data_to_fit,
+            init_params=[
+                0.0,
+                0.0,
+                0,
+            ],
+            show_plot=False,
+        )
+    xline = np.array(list(range(iteration_number)))
+    plt.plot(xline, _func0(xline, *params), "x")
+    plt.plot(xline, _func1(xline, *params), "x")
+    plt.show()
+
+    epsZX, epsIX, _ = params
+    logger.info(f"ZX error {round(epsZX*100, 2)}%, IX error {round(epsIX*100, 2)}%")
+    return epsZX, epsIX
+
+
+def CR_angle_fine_tuning(backend, qubits, gate_name, session, max_num_gate=10):
+    job_id = _CR_angle_error_amplification(
+        backend, qubits, gate_name, max_num_gate=max_num_gate, session=session
+    )
+    epsZX, epsIX = _analyize_CR_angle_data(job_id)
+
+    if np.abs(epsZX) + np.abs(epsZX) <= 0.01:
+        logger.info("No need for amplitude calibration.\n")
+        return
+
+    old_calibration_data = read_calibration_data(backend, gate_name, qubits)
+    modified_calibration_data = deepcopy(old_calibration_data)
+    modified_calibration_data["cr_params"]["amp"] *= 1 + epsZX
+    # Divided by 2
+    IX_amp_correction = omega_GHz_to_amp(
+        backend,
+        qubits[1],
+        modified_calibration_data["x_gate_coeffs"]["IX"] / 2 * epsIX / 1000,
+    )
+    modified_calibration_data["x_gate_ix_params"]["amp"] += IX_amp_correction
+
+    save_calibration_data(backend, gate_name, qubits, modified_calibration_data)
+    job_id2 = _CR_angle_error_amplification(
+        backend, qubits, gate_name, max_num_gate=max_num_gate, session=session
+    )
+    epsZX_new, epsIX_new = _analyize_CR_angle_data(job_id2)
+
+    if (epsZX_new**2 + epsIX_new**2) < (epsZX**2 + epsZX**2):
+        save_calibration_data(backend, gate_name, qubits, modified_calibration_data)
+        logger.info("CR drive ampliutude updated.\n")
+    else:
+        save_calibration_data(backend, gate_name, qubits, old_calibration_data)
+        logger.info("Calibration brings no improvement.\n")
