@@ -5,4 +5,4 @@ Apart from the standard calibration of the echoed Cross-Resonance, it also inclu
 - the calculation of the recursive DRAG pulse that suppress transition error on the control Transmon and the IY-DRAG pulse to cancel the ZZ interaction.
 - the calibration of direct Cross-Resonance gate.
 
-The dependence is documented under `requirement.txt`.
+The dependency is documented under `requirement.txt`, with qiskit support till `0.46`. The notebooks are tested under the given environment. As qiskit keeps evolving, there is no garantee that it alwasy works on the newest version.
