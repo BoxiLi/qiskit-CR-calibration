@@ -323,8 +323,9 @@ def create_echoed_cnot_schedule(
     }
     transpiled_circ = transpile(circ, backend=backend, **transpile_options)
     # Transfer Schedule to ScheduleBlock using pulse builder. Otherwise qiskit_ibm_provider rejects it.
-    with pulse.build(backend) as cnot_sched:
-        qiskit.pulse.builder.call(schedule(transpiled_circ, backend=backend))
+    cnot_sched = pulse.Schedule()
+    cnot_sched.append(schedule(transpiled_circ, backend=backend), inplace=True)
+
     return cnot_sched
 
 
@@ -443,8 +444,8 @@ def create_direct_cnot_schedule(
     }
     transpiled_circ = transpile(circ, backend=backend, **transpile_options)
     # Transfer Schedule to ScheduleBlock using pulse builder. Otherwise qiskit_ibm_provider rejects it.
-    with pulse.build(backend) as cnot_sched:
-        qiskit.pulse.builder.call(schedule(transpiled_circ, backend=backend))
+    cnot_sched = pulse.Schedule()
+    cnot_sched.append(schedule(transpiled_circ, backend=backend), inplace=True)
     return cnot_sched
 
 
