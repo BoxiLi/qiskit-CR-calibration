@@ -90,6 +90,12 @@ get_job_status = timeout_and_retry(timeout=10, reruns=8 * 60 * 60 * 2, verbose=F
 )
 
 
+def get_single_job_result(job):
+    """
+    Get the result of Qiskit job, avoid unpickling lambda functions.
+    """
+    return job.result()
+
 def get_job_result(job):
     """
     Get the result of a Qiskit job, waiting for its completion.
@@ -105,7 +111,7 @@ def get_job_result(job):
         time.sleep(30)
         job_finished = job.done()
     result = timeout_and_retry(timeout=30, reruns=5, verbose=True)(
-        lambda job: job.result()
+        get_single_job_result
     )(job)
     return result
 

@@ -497,63 +497,62 @@ def get_cr_schedule(qubits, backend, **kwargs):
         del ix_params["width"]
     qc, qt = qubits
 
-    with pulse.build(backend) as cr_schedule:
-        control_channel = pulse.control_channels(qc, qt)[0]
-        target_channel = pulse.drive_channel(qt)
-        if "beta" not in ix_params:
-            ix_params["beta"] = 0.0
+    cr_schedule = pulse.Schedule()
+    control_channel = pulse.ControlChannel(qc)
+    target_channel = pulse.DriveChannel(qt)
+    if "beta" not in ix_params:
+        ix_params["beta"] = 0.0
+    
+    # Generate CR pulse waveform
+    if "drag_type" in cr_params:
+        cr_pulse = get_custom_pulse_shape(
+            cr_params, backend, qc, frequency_offset=frequency_offset
+        )
+    else:
+        cr_pulse = _get_modulated_symbolic_pulse(
+            GaussianSquare, backend, cr_params, frequency_offset
+        )
+    
+    if "drag_type" in ix_params:
+        ix_pulse = get_custom_pulse_shape(
+            ix_params, backend, qc, frequency_offset=frequency_offset
+        )
+        if x_gate_ix_params is not None:
+            x_gate_pulse = get_custom_pulse_shape(
+                x_gate_ix_params, backend, qc, frequency_offset
+            )
+            ix_pulse = _add_waveform(ix_pulse, x_gate_pulse)
+    else:
+        ix_pulse = _get_modulated_symbolic_pulse(
+            GaussianSquareDrag, backend, ix_params, frequency_offset
+        )
+        if x_gate_ix_params is not None:
+            x_gate_pulse = _get_modulated_symbolic_pulse(
+                GaussianSquare, backend, x_gate_ix_params, frequency_offset
+            )
+            ix_pulse = _add_symbolic_gaussian_pulse(ix_pulse, x_gate_pulse)
+    
+    # Check if CR and IX pulse durations are equal
+    if cr_pulse.duration != ix_pulse.duration:
+        raise RuntimeError(
+            f"CR and IX pulse duration are not equal {cr_pulse.duration} and {ix_pulse.duration}."
+        )
+    cr_schedule.append(pulse.Play(cr_pulse, control_channel), inplace=True)
+    cr_schedule.append(pulse.Play(ix_pulse, target_channel), inplace=True)
 
-        # Generate CR pulse waveform
-        if "drag_type" in cr_params:
-            cr_pulse = get_custom_pulse_shape(
-                cr_params, backend, qc, frequency_offset=frequency_offset
-            )
-        else:
-            cr_pulse = _get_modulated_symbolic_pulse(
-                GaussianSquare, backend, cr_params, frequency_offset
-            )
-        # Generate IX pulse waveform
-        if "drag_type" in ix_params:
-            ix_pulse = get_custom_pulse_shape(
-                ix_params, backend, qc, frequency_offset=frequency_offset
-            )
-            if x_gate_ix_params is not None:
-                x_gate_pulse = get_custom_pulse_shape(
-                    x_gate_ix_params, backend, qc, frequency_offset
-                )
-                ix_pulse = _add_waveform(ix_pulse, x_gate_pulse)
-        else:
-            ix_pulse = _get_modulated_symbolic_pulse(
-                GaussianSquareDrag, backend, ix_params, frequency_offset
-            )
-            if x_gate_ix_params is not None:
-                x_gate_pulse = _get_modulated_symbolic_pulse(
-                    GaussianSquare, backend, x_gate_ix_params, frequency_offset
-                )
-                ix_pulse = _add_symbolic_gaussian_pulse(ix_pulse, x_gate_pulse)
-        # Check if CR and IX pulse durations are equal
-        if cr_pulse.duration != ix_pulse.duration:
-            raise RuntimeError(
-                f"CR and IX pulse duration are not equal {cr_pulse.duration} and {ix_pulse.duration}."
-            )
-
-        pulse.play(cr_pulse, control_channel)
-        pulse.play(ix_pulse, target_channel)
-
-        # Add the detuning
-        tmp_circ = QuantumCircuit(backend.num_qubits)
-        if backend.name == "DynamicsBackend":
-            pass
-            tmp_circ.rz(
-                +2 * pi * frequency_offset * backend.dt * ix_pulse.duration,
-                qt,
-            )
-        else:
-            tmp_circ.rz(
-                -2 * pi * frequency_offset * backend.dt * ix_pulse.duration,
-                qt,
-            )
-        pulse.call(schedule(tmp_circ, backend=backend))
+    tmp_circ = QuantumCircuit(backend.num_qubits)
+    if backend.name == "DynamicsBackend":
+        # pass
+        tmp_circ.rz(
+            +2 * pi * frequency_offset * backend.dt * ix_pulse.duration,
+            qt,
+        )
+    else:
+        tmp_circ.rz(
+            -2 * pi * frequency_offset * backend.dt * ix_pulse.duration,
+            qt,
+        )
+    cr_schedule.append(schedule(tmp_circ, backend=backend), inplace=True)
     return cr_schedule
 
 
