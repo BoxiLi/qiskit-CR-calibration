@@ -10,4 +10,4 @@ uncertainties
 lmfit
 pylatexenc
 qutip == 5.0.*
-jax[cpu] == 0.4.6
+jax[cpu] == 0.4.25
