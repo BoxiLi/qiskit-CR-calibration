@@ -10,7 +10,7 @@ jax.config.update("jax_platform_name", "cpu")
 from qiskit_dynamics.array import Array
 
 Array.set_default_backend("jax")
-from qiskit.test.mock import FakeLagos
+from qiskit_ibm_runtime.fake_provider import FakeLagos
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -79,6 +79,7 @@ def initilize_qiskit_dynamics_backend(
         hamiltonian_channels=["d0", "d1", "u0", "u1"],
         channel_carrier_freqs={"d0": v0, "d1": v1, "u0": v1 + cr_detuning, "u1": v0},
         dt=dt,
+        array_library="jax",
     )
 
     # Consistent solver option to use throughout notebook
@@ -125,13 +126,13 @@ def initilize_qiskit_dynamics_backend(
 
     # Add RZ instruction as phase shift for drag cal
     phi = Parameter("phi")
-    with pulse.build() as rz0:
-        pulse.shift_phase(phi, pulse.DriveChannel(0))
-        pulse.shift_phase(phi, pulse.ControlChannel(1))
+    rz0 = pulse.Schedule()
+    rz0.append(pulse.ShiftPhase(phi, pulse.DriveChannel(0)), inplace=True)
+    rz0.append(pulse.ShiftPhase(phi, pulse.ControlChannel(1)), inplace=True)
 
-    with pulse.build() as rz1:
-        pulse.shift_phase(phi, pulse.DriveChannel(1))
-        pulse.shift_phase(phi, pulse.ControlChannel(0))
+    rz1 = pulse.Schedule()
+    rz1.append(pulse.ShiftPhase(phi, pulse.DriveChannel(1)), inplace=True)
+    rz1.append(pulse.ShiftPhase(phi, pulse.ControlChannel(0)), inplace=True)
 
     target.add_instruction(
         RZGate(phi),

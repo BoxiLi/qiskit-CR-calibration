@@ -1,15 +1,13 @@
-numpy == 1.26.3
-scipy == 1.11.4
+numpy == 1.26.4
+scipy == 1.13.1
 matplotlib == 3.7.*
-qiskit == 0.45.1
-qiskit-dynamics == 0.4.2
-qiskit-experiments == 0.5.4
-qiskit-experiments == 0.5.4
-qiskit-ibm-provider == 0.8.0
-qiskit-ibm-runtime == 0.17.0
-qiskit-terra == 0.45.1
+qiskit == 1.1.1
+qiskit-dynamics == 0.5.1
+qiskit-experiments == 0.7.0
+qiskit-ibm-runtime == 0.24.1
+qiskit-ibm-experiment == 0.4.7
 uncertainties
 lmfit
 pylatexenc
 qutip == 5.0.*
-jax[cpu] == 0.4.23
+jax[cpu] == 0.4.25
